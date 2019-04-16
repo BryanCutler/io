@@ -120,10 +120,11 @@ class ArrowDataset(ArrowBaseDataset):
   """
 
   def __init__(self,
-               record_batches,
                columns,
                output_types,
-               output_shapes=None):
+               output_shapes=None,
+               arrow_buffer=None,
+               serialized_batches=None):
     """Create an ArrowDataset directly from Arrow record batches.
     This constructor requires pyarrow to be installed.
 
@@ -134,11 +135,53 @@ class ArrowDataset(ArrowBaseDataset):
       output_shapes: TensorShapes of the output tensors or None to
                      infer partial
     """
+    if arrow_buffer is None and serialized_batches is None:
+      raise InvalidArgumentError(
+          "Must set either buffer_address or serialized_batches argument")
+    self._arrow_buffer = arrow_buffer
+    if self._arrow_buffer is not None:
+      address_int = arrow_buffer.address
+      self._buffer_address = tensorflow.convert_to_tensor(
+          address_int,
+          dtype=dtypes.uint64,  # TODO
+          name="buffer_address")
+      self._buffer_size = tensorflow.convert_to_tensor(
+          arrow_buffer.size,
+          dtype=dtypes.int64,
+          name="buffer_size")
+      print("Python buffer: {}, size: {}".format(address_int, arrow_buffer.size))
+    else:
+      self._buffer_address = None
+      self._buffer_size = None
+    self._serialized_batches = serialized_batches
     self._columns = columns
     self._output_types = output_types
     self._output_shapes = output_shapes or \
         nest.map_structure(
             lambda _: tensorflow.TensorShape(None), self._output_types)
+    super(ArrowDataset, self).__init__(columns, output_types, output_shapes)
+
+  def _as_variant_tensor(self):
+    if self._buffer_address is not None:
+      return arrow_ops.arrow_dataset(
+          self._buffer_address,
+          self._buffer_size,
+          self._columns,
+          nest.flatten(self.output_types),
+          nest.flatten(self.output_shapes))
+    else:
+      return arrow_ops.arrow_serialized_dataset(
+          self._serialized_batches,
+          self._columns,
+          nest.flatten(self.output_types),
+          nest.flatten(self.output_shapes))
+
+  @classmethod
+  def from_record_bat_ser(cls,
+                          record_batches,
+                          columns,
+                          output_types,
+                          output_shapes=None):
     import pyarrow as pa
     if isinstance(record_batches, pa.RecordBatch):
       record_batches = [record_batches]
@@ -148,18 +191,32 @@ class ArrowDataset(ArrowBaseDataset):
     for batch in record_batches:
       writer.write_batch(batch)
     writer.close()
-    self._serialized_batches = tensorflow.convert_to_tensor(
+    serialized_batches = tensorflow.convert_to_tensor(
         buf.getvalue(),
         dtype=dtypes.string,
         name="serialized_batches")
-    super(ArrowDataset, self).__init__(columns, output_types, output_shapes)
+    return cls(
+        columns,
+        output_types,
+        output_shapes,
+        serialized_batches=serialized_batches)
 
-  def _as_variant_tensor(self):
-    return arrow_ops.arrow_dataset(
-        self._serialized_batches,
-        self._columns,
-        nest.flatten(self.output_types),
-        nest.flatten(self.output_shapes))
+  @classmethod
+  def from_record_batches(cls,
+                          record_batches,
+                          columns,
+                          output_types,
+                          output_shapes=None):
+    import pyarrow as pa
+    if isinstance(record_batches, pa.RecordBatch):
+      record_batches = [record_batches]
+    assert record_batches
+    sink = pa.BufferOutputStream()
+    writer = pa.RecordBatchFileWriter(sink, record_batches[0].schema)
+    for batch in record_batches:
+      writer.write_batch(batch)
+    writer.close()
+    return cls(columns, output_types, output_shapes, arrow_buffer=sink.getvalue())
 
   @classmethod
   def from_pandas(cls, df, columns=None, preserve_index=True):
@@ -179,7 +236,7 @@ class ArrowDataset(ArrowBaseDataset):
     batch = pa.RecordBatch.from_pandas(df, preserve_index=preserve_index)
     columns = tuple(range(batch.num_columns))
     output_types, output_shapes = arrow_schema_to_tensor_types(batch.schema)
-    return cls(batch, columns, output_types, output_shapes)
+    return cls.from_record_batches(batch, columns, output_types, output_shapes)
 
 
 class ArrowFeatherDataset(ArrowBaseDataset):
